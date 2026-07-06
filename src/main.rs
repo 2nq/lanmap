@@ -6,22 +6,41 @@ use std::sync::{Arc, Mutex};
 use ipnetwork::Ipv4Network;
 use scanner::ScanState;
 
+// Optional: lanmap --subnet 192.168.1.0/24
+fn parse_forced_subnet() -> Option<Ipv4Network> {
+    let args: Vec<String> = std::env::args().collect();
+    let pos = args.iter().position(|a| a == "--subnet")?;
+
+    let Some(raw) = args.get(pos + 1) else {
+        eprintln!("error: --subnet requires a value, e.g. --subnet 192.168.1.0/24");
+        std::process::exit(2);
+    };
+    match raw.parse::<Ipv4Network>() {
+        Ok(net) if net.prefix() >= 16 => Some(net),
+        Ok(net) => {
+            eprintln!(
+                "error: subnet {} is too large to sweep — /16 is the maximum",
+                net
+            );
+            std::process::exit(2);
+        }
+        Err(e) => {
+            eprintln!("error: invalid subnet '{}': {}", raw, e);
+            std::process::exit(2);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    // Optional: lanmap --subnet 192.168.1.0/24
-    let forced_subnet = std::env::args()
-        .skip_while(|a| a != "--subnet")
-        .nth(1)
-        .and_then(|s| s.parse::<Ipv4Network>().ok());
+    let forced_subnet = parse_forced_subnet();
 
     let state = Arc::new(Mutex::new(ScanState::default()));
 
-    // If user forced a subnet, pre-fill it so the scanner uses it directly
+    // Pre-fill a forced subnet; the scanner still detects the real local IP
+    // so it can exclude ourselves from the sweep.
     if let Some(subnet) = forced_subnet {
-        let local = subnet.ip(); // treat network addr as "us" for filtering
-        let mut s = state.lock().unwrap();
-        s.subnet = Some(subnet);
-        s.local_ip = Some(local);
+        state.lock().unwrap().subnet = Some(subnet);
     }
 
     let scanner_state = Arc::clone(&state);

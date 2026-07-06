@@ -9,10 +9,13 @@ A live LAN scanner with a terminal dashboard. Shows all devices on your network 
 
 - Auto-detects your local subnet (`/24`)
 - Parallel ICMP ping sweep — all 254 hosts concurrently
-- MAC address lookup via ARP cache
+- Finds hosts that block ping but answer ARP (e.g. Windows firewalls)
+- MAC address lookup via ARP cache (Windows and Linux)
 - Vendor identification from OUI (Apple, Samsung, ASUS, TP-Link, and more)
 - Detects MAC randomization (iOS / Android privacy MACs)
 - Reverse DNS hostname resolution
+- "★ new" badge for devices that join while lanmap is running
+- Offline hosts show when they were last seen
 - Live ratatui TUI with animated scanning indicator
 - Auto-rescan every 30 seconds
 
@@ -24,7 +27,7 @@ A live LAN scanner with a terminal dashboard. Shows all devices on your network 
 lanmap
 ```
 
-Override subnet manually (useful when on VPN):
+Override subnet manually (useful when on VPN; `/16` is the maximum sweep size):
 
 ```
 lanmap --subnet 192.168.1.0/24

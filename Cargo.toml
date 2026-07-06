@@ -1,6 +1,6 @@
 [package]
 name = "lanmap"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Live LAN scanner with terminal dashboard"
 
@@ -12,5 +12,4 @@ ipnetwork = "0.20"
 dns-lookup = "2.0"
 ratatui = "0.28"
 crossterm = "0.28"
-rand = "0.8"
 anyhow = "1"

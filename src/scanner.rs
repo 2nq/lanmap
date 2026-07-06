@@ -6,8 +6,12 @@ use std::time::{Duration, Instant};
 use dns_lookup::lookup_addr;
 use ipnetwork::Ipv4Network;
 use network_interface::{Addr, NetworkInterface, NetworkInterfaceConfig};
-use rand::random;
 use surge_ping::{Client, Config, IcmpPacket, PingIdentifier, PingSequence, ICMP};
+
+pub const RESCAN_INTERVAL: Duration = Duration::from_secs(30);
+const PING_TIMEOUT: Duration = Duration::from_millis(1000);
+// Some devices ignore zero-length echo requests; send a small payload like `ping` does.
+const PING_PAYLOAD: [u8; 16] = *b"lanmap-probe-016";
 
 #[derive(Clone, Debug)]
 pub struct HostInfo {
@@ -15,12 +19,15 @@ pub struct HostInfo {
     pub hostname: Option<String>,
     pub mac: Option<String>,
     pub vendor: Option<String>,
-    pub latency_ms: Option<u64>,
+    pub latency_ms: Option<f64>,
     pub online: bool,
+    /// Discovered after the first full sweep, i.e. it joined while we were watching.
+    pub is_new: bool,
     pub first_seen: Instant,
     pub last_seen: Instant,
 }
 
+#[derive(Default)]
 pub struct ScanState {
     pub hosts: Vec<HostInfo>,
     pub subnet: Option<Ipv4Network>,
@@ -31,22 +38,7 @@ pub struct ScanState {
     pub last_scan: Option<Instant>,
     pub error: Option<String>,
     pub rescan_requested: bool,
-}
-
-impl Default for ScanState {
-    fn default() -> Self {
-        Self {
-            hosts: Vec::new(),
-            subnet: None,
-            local_ip: None,
-            scanning: false,
-            scan_progress: 0,
-            scan_total: 0,
-            last_scan: None,
-            error: None,
-            rescan_requested: false,
-        }
-    }
+    pub first_scan_done: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -54,7 +46,7 @@ impl Default for ScanState {
 // ---------------------------------------------------------------------------
 
 fn lookup_vendor(mac: &str) -> Option<&'static str> {
-    let parts: Vec<&str> = mac.splitn(6, |c| c == ':' || c == '-').collect();
+    let parts: Vec<&str> = mac.splitn(6, [':', '-']).collect();
     if parts.len() < 3 {
         return None;
     }
@@ -193,11 +185,66 @@ fn lookup_vendor(mac: &str) -> Option<&'static str> {
 }
 
 // ---------------------------------------------------------------------------
-// ARP table — parses `arp -a` output to get IP → MAC mappings
+// ARP table — IP → MAC mappings from /proc/net/arp (Linux) or `arp -a`
 // ---------------------------------------------------------------------------
+
+// Format-agnostic: takes the first IP-looking token and the first MAC-looking
+// token from a line. Handles Windows (`192.168.1.1  aa-bb-...  dynamic`),
+// Linux/macOS `arp -a` (`? (192.168.1.1) at aa:bb:... [ether] on eth0`) and
+// /proc/net/arp rows alike.
+fn parse_arp_line(line: &str) -> Option<(Ipv4Addr, String)> {
+    let mut ip = None;
+    let mut mac = None;
+    for tok in line.split_whitespace() {
+        let tok = tok.trim_matches(|c| c == '(' || c == ')');
+        if ip.is_none() {
+            if let Ok(parsed) = tok.parse::<Ipv4Addr>() {
+                ip = Some(parsed);
+                continue;
+            }
+        }
+        if mac.is_none() && tok.len() == 17 {
+            let norm = tok.replace('-', ":").to_lowercase();
+            let mut octets = norm.split(':');
+            if octets.clone().count() == 6
+                && octets.all(|o| o.len() == 2 && o.chars().all(|c| c.is_ascii_hexdigit()))
+            {
+                mac = Some(norm);
+            }
+        }
+        if ip.is_some() && mac.is_some() {
+            break;
+        }
+    }
+    ip.zip(mac)
+}
+
+// Reject incomplete (all-zero), broadcast, and multicast (group bit set) entries.
+fn is_unicast_mac(mac: &str) -> bool {
+    if mac == "00:00:00:00:00:00" {
+        return false;
+    }
+    matches!(u8::from_str_radix(&mac[..2], 16), Ok(first) if first & 0x01 == 0)
+}
 
 async fn fetch_arp_table() -> HashMap<Ipv4Addr, String> {
     let mut map = HashMap::new();
+
+    // Linux: read the kernel table directly — `arp` (net-tools) is often not installed.
+    #[cfg(target_os = "linux")]
+    if let Ok(content) = tokio::fs::read_to_string("/proc/net/arp").await {
+        for line in content.lines().skip(1) {
+            if let Some((ip, mac)) = parse_arp_line(line) {
+                if is_unicast_mac(&mac) {
+                    map.insert(ip, mac);
+                }
+            }
+        }
+        if !map.is_empty() {
+            return map;
+        }
+    }
+
     let Ok(out) = tokio::process::Command::new("arp")
         .arg("-a")
         .output()
@@ -206,20 +253,65 @@ async fn fetch_arp_table() -> HashMap<Ipv4Addr, String> {
         return map;
     };
     for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 2 {
-            continue;
-        }
-        let Ok(ip) = parts[0].parse::<Ipv4Addr>() else {
-            continue;
-        };
-        let mac = parts[1].replace('-', ":").to_lowercase();
-        // skip broadcast (ff:ff:...) and invalid entries
-        if mac.len() == 17 && !mac.starts_with("ff") {
-            map.insert(ip, mac);
+        if let Some((ip, mac)) = parse_arp_line(line) {
+            if is_unicast_mac(&mac) {
+                map.insert(ip, mac);
+            }
         }
     }
     map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_windows_arp_output() {
+        let (ip, mac) = parse_arp_line("  192.168.1.1           aa-bb-cc-dd-ee-0f     dynamic").unwrap();
+        assert_eq!(ip, Ipv4Addr::new(192, 168, 1, 1));
+        assert_eq!(mac, "aa:bb:cc:dd:ee:0f");
+    }
+
+    #[test]
+    fn parses_linux_arp_output() {
+        let (ip, mac) = parse_arp_line("? (192.168.1.1) at aa:bb:cc:dd:ee:0f [ether] on wlan0").unwrap();
+        assert_eq!(ip, Ipv4Addr::new(192, 168, 1, 1));
+        assert_eq!(mac, "aa:bb:cc:dd:ee:0f");
+    }
+
+    #[test]
+    fn parses_proc_net_arp() {
+        let (ip, mac) = parse_arp_line("192.168.1.7      0x1         0x2         aa:bb:cc:dd:ee:0f     *        eth0").unwrap();
+        assert_eq!(ip, Ipv4Addr::new(192, 168, 1, 7));
+        assert_eq!(mac, "aa:bb:cc:dd:ee:0f");
+    }
+
+    #[test]
+    fn skips_lines_without_ip_and_mac() {
+        assert!(parse_arp_line("Interface: 192.168.1.5 --- 0x10").is_none());
+        assert!(parse_arp_line("  Internet Address      Physical Address      Type").is_none());
+        assert!(parse_arp_line("").is_none());
+    }
+
+    #[test]
+    fn rejects_non_unicast_macs() {
+        assert!(!is_unicast_mac("ff:ff:ff:ff:ff:ff")); // broadcast
+        assert!(!is_unicast_mac("01:00:5e:00:00:fb")); // IPv4 multicast
+        assert!(!is_unicast_mac("33:33:00:00:00:01")); // IPv6 multicast
+        assert!(!is_unicast_mac("00:00:00:00:00:00")); // incomplete
+        assert!(is_unicast_mac("aa:bb:cc:dd:ee:0f"));
+    }
+
+    #[test]
+    fn vendor_lookup_detects_randomized_and_known_ouis() {
+        assert_eq!(lookup_vendor("b8:27:eb:12:34:56"), Some("Raspberry Pi"));
+        assert_eq!(lookup_vendor("B8-27-EB-12-34-56"), Some("Raspberry Pi"));
+        // locally-administered bit set → randomized privacy MAC
+        assert_eq!(lookup_vendor("da:11:22:33:44:55"), Some("Randomized"));
+        assert_eq!(lookup_vendor("11:22:33:44:55:66"), None);
+        assert_eq!(lookup_vendor("garbage"), None);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -272,28 +364,34 @@ pub fn detect_subnet() -> Option<(Ipv4Addr, Ipv4Network)> {
 // Ping helpers
 // ---------------------------------------------------------------------------
 
-async fn ping_once(client: &Client, ip: Ipv4Addr) -> Option<u64> {
-    let mut pinger = client
-        .pinger(IpAddr::V4(ip), PingIdentifier(random()))
-        .await;
-    pinger.timeout(Duration::from_millis(1000));
-    match pinger.ping(PingSequence(0), &[]).await {
-        Ok((IcmpPacket::V4(_), dur)) => Some(dur.as_millis() as u64),
+async fn ping_once(client: &Client, ip: Ipv4Addr) -> Option<f64> {
+    // The identifier must be unique per in-flight pinger or replies can be
+    // misrouted; derive it from the address (unique within a /16 or smaller,
+    // which parse_forced_subnet guarantees).
+    let ident = PingIdentifier(u32::from(ip) as u16);
+    let mut pinger = client.pinger(IpAddr::V4(ip), ident).await;
+    pinger.timeout(PING_TIMEOUT);
+    match pinger.ping(PingSequence(0), &PING_PAYLOAD).await {
+        Ok((IcmpPacket::V4(_), dur)) => Some(dur.as_secs_f64() * 1000.0),
         _ => None,
     }
 }
 
-async fn probe_host(client: Arc<Client>, ip: Ipv4Addr) -> (Ipv4Addr, Option<u64>, Option<String>) {
+async fn probe_host(client: Arc<Client>, ip: Ipv4Addr) -> (Ipv4Addr, Option<f64>, Option<String>) {
     let latency = ping_once(&client, ip).await;
     let hostname = if latency.is_some() {
-        tokio::task::spawn_blocking(move || lookup_addr(&IpAddr::V4(ip)).ok())
-            .await
-            .ok()
-            .flatten()
+        resolve_hostname(ip).await
     } else {
         None
     };
     (ip, latency, hostname)
+}
+
+async fn resolve_hostname(ip: Ipv4Addr) -> Option<String> {
+    tokio::task::spawn_blocking(move || lookup_addr(&IpAddr::V4(ip)).ok())
+        .await
+        .ok()
+        .flatten()
 }
 
 // ---------------------------------------------------------------------------
@@ -301,28 +399,26 @@ async fn probe_host(client: Arc<Client>, ip: Ipv4Addr) -> (Ipv4Addr, Option<u64>
 // ---------------------------------------------------------------------------
 
 pub async fn run_scanner(state: Arc<Mutex<ScanState>>) {
-    let already = {
-        let s = state.lock().unwrap();
-        s.subnet.zip(s.local_ip)
-    };
+    let forced = state.lock().unwrap().subnet;
+    let detected = detect_subnet();
 
-    let (local_ip, subnet) = match already {
-        Some((subnet, ip)) => (ip, subnet),
-        None => match detect_subnet() {
-            Some(s) => s,
-            None => {
-                state.lock().unwrap().error = Some(
-                    "Could not detect local IP. Try: lanmap --subnet 192.168.1.0/24".into(),
-                );
-                return;
-            }
-        },
+    let (subnet, local_ip) = match (forced, detected) {
+        // Forced subnet: keep the real local IP for self-exclusion, but only
+        // if it actually lies inside the forced range.
+        (Some(net), detected) => (net, detected.map(|(ip, _)| ip).filter(|ip| net.contains(*ip))),
+        (None, Some((ip, net))) => (net, Some(ip)),
+        (None, None) => {
+            state.lock().unwrap().error = Some(
+                "Could not detect local IP. Try: lanmap --subnet 192.168.1.0/24".into(),
+            );
+            return;
+        }
     };
 
     {
         let mut s = state.lock().unwrap();
         s.subnet = Some(subnet);
-        s.local_ip = Some(local_ip);
+        s.local_ip = local_ip;
     }
 
     let client = match Client::new(&Config::builder().kind(ICMP::V4).build()) {
@@ -342,7 +438,7 @@ pub async fn run_scanner(state: Arc<Mutex<ScanState>>) {
     loop {
         let targets: Vec<Ipv4Addr> = subnet
             .iter()
-            .filter(|&ip| ip != local_ip && ip != network_addr && ip != broadcast_addr)
+            .filter(|&ip| Some(ip) != local_ip && ip != network_addr && ip != broadcast_addr)
             .collect();
 
         {
@@ -361,47 +457,107 @@ pub async fn run_scanner(state: Arc<Mutex<ScanState>>) {
 
         let now = Instant::now();
         while let Some(result) = join_set.join_next().await {
-            if let Ok((ip, latency, hostname)) = result {
-                let online = latency.is_some();
-                let mut s = state.lock().unwrap();
-                s.scan_progress += 1;
+            let Ok((ip, latency, hostname)) = result else {
+                continue;
+            };
+            let online = latency.is_some();
+            let mut s = state.lock().unwrap();
+            s.scan_progress += 1;
 
-                if let Some(host) = s.hosts.iter_mut().find(|h| h.ip == ip) {
-                    host.online = online;
-                    host.latency_ms = latency;
+            if let Some(host) = s.hosts.iter_mut().find(|h| h.ip == ip) {
+                host.online = online;
+                host.latency_ms = latency;
+                if online {
                     host.last_seen = now;
-                    if hostname.is_some() {
-                        host.hostname = hostname;
-                    }
-                } else if online {
-                    s.hosts.push(HostInfo {
-                        ip,
-                        hostname,
-                        mac: None,
-                        vendor: None,
-                        latency_ms: latency,
-                        online,
-                        first_seen: now,
-                        last_seen: now,
-                    });
                 }
-
+                if hostname.is_some() {
+                    host.hostname = hostname;
+                }
+            } else if online {
+                let is_new = s.first_scan_done;
+                s.hosts.push(HostInfo {
+                    ip,
+                    hostname,
+                    mac: None,
+                    vendor: None,
+                    latency_ms: latency,
+                    online,
+                    is_new,
+                    first_seen: now,
+                    last_seen: now,
+                });
                 s.hosts.sort_by_key(|h| u32::from(h.ip));
             }
         }
 
-        // After pings complete, fetch ARP table (pings populate it)
+        // The sweep just refreshed the OS ARP cache; harvest it. Besides MAC →
+        // vendor info, this finds hosts that drop ICMP (e.g. Windows firewalls)
+        // but still answered ARP at layer 2.
         let arp = fetch_arp_table().await;
+
+        let silent_hosts: Vec<(Ipv4Addr, String)> = {
+            let s = state.lock().unwrap();
+            arp.iter()
+                .filter(|(&ip, _)| {
+                    subnet.contains(ip)
+                        && ip != network_addr
+                        && ip != broadcast_addr
+                        && Some(ip) != local_ip
+                        && !s.hosts.iter().any(|h| h.ip == ip)
+                })
+                .map(|(&ip, mac)| (ip, mac.clone()))
+                .collect()
+        };
+
+        // Resolve hostnames for ARP-only discoveries before inserting them —
+        // the ping path only resolves hosts that answered.
+        let mut dns_set = tokio::task::JoinSet::new();
+        for (ip, mac) in silent_hosts {
+            dns_set.spawn(async move {
+                let hostname = resolve_hostname(ip).await;
+                (ip, mac, hostname)
+            });
+        }
+        let mut discovered = Vec::new();
+        while let Some(result) = dns_set.join_next().await {
+            if let Ok(entry) = result {
+                discovered.push(entry);
+            }
+        }
+
         {
             let mut s = state.lock().unwrap();
+            let arp_now = Instant::now();
             for host in &mut s.hosts {
                 if let Some(mac) = arp.get(&host.ip) {
-                    let vendor = lookup_vendor(mac).map(|v| v.to_string());
+                    host.vendor = lookup_vendor(mac).map(str::to_string);
                     host.mac = Some(mac.clone());
-                    host.vendor = vendor;
+                    if !host.online {
+                        // ARP entry survived the sweep: host is up, just not
+                        // answering pings.
+                        host.online = true;
+                        host.last_seen = arp_now;
+                    }
                 }
             }
+            let is_new = s.first_scan_done;
+            for (ip, mac, hostname) in discovered {
+                let vendor = lookup_vendor(&mac).map(str::to_string);
+                s.hosts.push(HostInfo {
+                    ip,
+                    hostname,
+                    mac: Some(mac),
+                    vendor,
+                    latency_ms: None,
+                    online: true,
+                    is_new,
+                    first_seen: arp_now,
+                    last_seen: arp_now,
+                });
+            }
+            s.hosts.sort_by_key(|h| u32::from(h.ip));
             s.scanning = false;
+            s.first_scan_done = true;
             s.last_scan = Some(Instant::now());
         }
 
@@ -409,7 +565,7 @@ pub async fn run_scanner(state: Arc<Mutex<ScanState>>) {
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
             waited += Duration::from_millis(500);
-            if state.lock().unwrap().rescan_requested || waited >= Duration::from_secs(30) {
+            if state.lock().unwrap().rescan_requested || waited >= RESCAN_INTERVAL {
                 break;
             }
         }

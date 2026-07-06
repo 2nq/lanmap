@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossterm::{
+    cursor::Show,
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -16,9 +17,11 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use crate::scanner::ScanState;
+use crate::scanner::{ScanState, RESCAN_INTERVAL};
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+// How long a newly-joined device keeps its "new" badge.
+const NEW_BADGE_TTL: Duration = Duration::from_secs(300);
 
 pub struct App {
     pub state: Arc<Mutex<ScanState>>,
@@ -62,9 +65,28 @@ impl App {
 
 pub fn run(state: Arc<Mutex<ScanState>>) -> anyhow::Result<()> {
     enable_raw_mode()?;
-    let mut out = stdout();
-    execute!(out, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(out);
+    execute!(stdout(), EnterAlternateScreen)?;
+
+    // Restore the terminal even if the UI loop errors or panics — a broken
+    // raw-mode terminal would otherwise swallow the error message itself.
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        original_hook(info);
+    }));
+
+    let result = run_loop(state);
+    restore_terminal();
+    result
+}
+
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(stdout(), LeaveAlternateScreen, Show);
+}
+
+fn run_loop(state: Arc<Mutex<ScanState>>) -> anyhow::Result<()> {
+    let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
     terminal.hide_cursor()?;
 
@@ -98,9 +120,6 @@ pub fn run(state: Arc<Mutex<ScanState>>) -> anyhow::Result<()> {
         }
     }
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
     Ok(())
 }
 
@@ -219,9 +238,16 @@ fn render_table(f: &mut Frame, area: Rect, state: &ScanState, table_state: &mut 
         .iter()
         .map(|host| {
             let (status_sym, status_style) = if host.online {
-                ("● online ", Style::default().fg(Color::Green))
+                if host.is_new && host.first_seen.elapsed() < NEW_BADGE_TTL {
+                    ("★ new".to_string(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                } else {
+                    ("● online".to_string(), Style::default().fg(Color::Green))
+                }
             } else {
-                ("○ offline", Style::default().fg(Color::DarkGray))
+                (
+                    format!("○ {} ago", fmt_age(host.last_seen.elapsed())),
+                    Style::default().fg(Color::DarkGray),
+                )
             };
 
             let ip_style = if host.online {
@@ -232,7 +258,7 @@ fn render_table(f: &mut Frame, area: Rect, state: &ScanState, table_state: &mut 
 
             let latency = host
                 .latency_ms
-                .map(|ms| format!("{} ms", ms))
+                .map(|ms| format!("{:.1} ms", ms))
                 .unwrap_or_else(|| "—".into());
 
             let mac = host.mac.clone().unwrap_or_else(|| "—".into());
@@ -287,14 +313,30 @@ fn render_table(f: &mut Frame, area: Rect, state: &ScanState, table_state: &mut 
     f.render_stateful_widget(table, area, table_state);
 }
 
+fn fmt_age(age: Duration) -> String {
+    let secs = age.as_secs();
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
+    }
+}
+
 fn render_footer(f: &mut Frame, area: Rect, state: &ScanState) {
-    let next = state
-        .last_scan
-        .map(|t| {
-            let remaining = 30u64.saturating_sub(t.elapsed().as_secs());
-            format!("next scan in {}s", remaining)
-        })
-        .unwrap_or_else(|| "scanning…".into());
+    let next = if state.scanning {
+        "scanning…".to_string()
+    } else if state.rescan_requested {
+        "rescan queued".to_string()
+    } else if let Some(t) = state.last_scan {
+        let remaining = RESCAN_INTERVAL
+            .as_secs()
+            .saturating_sub(t.elapsed().as_secs());
+        format!("next scan in {}s", remaining)
+    } else {
+        "starting…".to_string()
+    };
 
     let line = Line::from(vec![
         Span::styled(" [q]", Style::default().fg(Color::Yellow)),
