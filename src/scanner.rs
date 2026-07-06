@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dns_lookup::lookup_addr;
 use ipnetwork::Ipv4Network;
 use network_interface::{Addr, NetworkInterface, NetworkInterfaceConfig};
+use serde::Serialize;
 use surge_ping::{Client, Config, IcmpPacket, PingIdentifier, PingSequence, ICMP};
 
 pub const RESCAN_INTERVAL: Duration = Duration::from_secs(30);
@@ -39,6 +40,66 @@ pub struct ScanState {
     pub error: Option<String>,
     pub rescan_requested: bool,
     pub first_scan_done: bool,
+}
+
+// ---------------------------------------------------------------------------
+// JSON export
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct HostExport<'a> {
+    ip: String,
+    hostname: Option<&'a str>,
+    mac: Option<&'a str>,
+    vendor: Option<&'a str>,
+    latency_ms: Option<f64>,
+    online: bool,
+    seconds_since_seen: u64,
+}
+
+#[derive(Serialize)]
+struct ScanExport<'a> {
+    subnet: Option<String>,
+    local_ip: Option<String>,
+    exported_unix: u64,
+    total_hosts: usize,
+    online_hosts: usize,
+    hosts: Vec<HostExport<'a>>,
+}
+
+/// Serialize the current host list to pretty JSON. `Instant` fields aren't
+/// meaningful as absolute times, so `last_seen` is emitted as an age in seconds.
+pub fn export_json(state: &ScanState) -> serde_json::Result<String> {
+    let now = Instant::now();
+    let exported_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let hosts: Vec<HostExport> = state
+        .hosts
+        .iter()
+        .map(|h| HostExport {
+            ip: h.ip.to_string(),
+            hostname: h.hostname.as_deref(),
+            mac: h.mac.as_deref(),
+            vendor: h.vendor.as_deref(),
+            latency_ms: h.latency_ms,
+            online: h.online,
+            seconds_since_seen: now.saturating_duration_since(h.last_seen).as_secs(),
+        })
+        .collect();
+
+    let export = ScanExport {
+        subnet: state.subnet.map(|s| s.to_string()),
+        local_ip: state.local_ip.map(|ip| ip.to_string()),
+        exported_unix,
+        total_hosts: state.hosts.len(),
+        online_hosts: state.hosts.iter().filter(|h| h.online).count(),
+        hosts,
+    };
+
+    serde_json::to_string_pretty(&export)
 }
 
 // ---------------------------------------------------------------------------
@@ -260,58 +321,6 @@ async fn fetch_arp_table() -> HashMap<Ipv4Addr, String> {
         }
     }
     map
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_windows_arp_output() {
-        let (ip, mac) = parse_arp_line("  192.168.1.1           aa-bb-cc-dd-ee-0f     dynamic").unwrap();
-        assert_eq!(ip, Ipv4Addr::new(192, 168, 1, 1));
-        assert_eq!(mac, "aa:bb:cc:dd:ee:0f");
-    }
-
-    #[test]
-    fn parses_linux_arp_output() {
-        let (ip, mac) = parse_arp_line("? (192.168.1.1) at aa:bb:cc:dd:ee:0f [ether] on wlan0").unwrap();
-        assert_eq!(ip, Ipv4Addr::new(192, 168, 1, 1));
-        assert_eq!(mac, "aa:bb:cc:dd:ee:0f");
-    }
-
-    #[test]
-    fn parses_proc_net_arp() {
-        let (ip, mac) = parse_arp_line("192.168.1.7      0x1         0x2         aa:bb:cc:dd:ee:0f     *        eth0").unwrap();
-        assert_eq!(ip, Ipv4Addr::new(192, 168, 1, 7));
-        assert_eq!(mac, "aa:bb:cc:dd:ee:0f");
-    }
-
-    #[test]
-    fn skips_lines_without_ip_and_mac() {
-        assert!(parse_arp_line("Interface: 192.168.1.5 --- 0x10").is_none());
-        assert!(parse_arp_line("  Internet Address      Physical Address      Type").is_none());
-        assert!(parse_arp_line("").is_none());
-    }
-
-    #[test]
-    fn rejects_non_unicast_macs() {
-        assert!(!is_unicast_mac("ff:ff:ff:ff:ff:ff")); // broadcast
-        assert!(!is_unicast_mac("01:00:5e:00:00:fb")); // IPv4 multicast
-        assert!(!is_unicast_mac("33:33:00:00:00:01")); // IPv6 multicast
-        assert!(!is_unicast_mac("00:00:00:00:00:00")); // incomplete
-        assert!(is_unicast_mac("aa:bb:cc:dd:ee:0f"));
-    }
-
-    #[test]
-    fn vendor_lookup_detects_randomized_and_known_ouis() {
-        assert_eq!(lookup_vendor("b8:27:eb:12:34:56"), Some("Raspberry Pi"));
-        assert_eq!(lookup_vendor("B8-27-EB-12-34-56"), Some("Raspberry Pi"));
-        // locally-administered bit set → randomized privacy MAC
-        assert_eq!(lookup_vendor("da:11:22:33:44:55"), Some("Randomized"));
-        assert_eq!(lookup_vendor("11:22:33:44:55:66"), None);
-        assert_eq!(lookup_vendor("garbage"), None);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -569,5 +578,86 @@ pub async fn run_scanner(state: Arc<Mutex<ScanState>>) {
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_windows_arp_output() {
+        let (ip, mac) = parse_arp_line("  192.168.1.1           aa-bb-cc-dd-ee-0f     dynamic").unwrap();
+        assert_eq!(ip, Ipv4Addr::new(192, 168, 1, 1));
+        assert_eq!(mac, "aa:bb:cc:dd:ee:0f");
+    }
+
+    #[test]
+    fn parses_linux_arp_output() {
+        let (ip, mac) = parse_arp_line("? (192.168.1.1) at aa:bb:cc:dd:ee:0f [ether] on wlan0").unwrap();
+        assert_eq!(ip, Ipv4Addr::new(192, 168, 1, 1));
+        assert_eq!(mac, "aa:bb:cc:dd:ee:0f");
+    }
+
+    #[test]
+    fn parses_proc_net_arp() {
+        let (ip, mac) = parse_arp_line("192.168.1.7      0x1         0x2         aa:bb:cc:dd:ee:0f     *        eth0").unwrap();
+        assert_eq!(ip, Ipv4Addr::new(192, 168, 1, 7));
+        assert_eq!(mac, "aa:bb:cc:dd:ee:0f");
+    }
+
+    #[test]
+    fn skips_lines_without_ip_and_mac() {
+        assert!(parse_arp_line("Interface: 192.168.1.5 --- 0x10").is_none());
+        assert!(parse_arp_line("  Internet Address      Physical Address      Type").is_none());
+        assert!(parse_arp_line("").is_none());
+    }
+
+    #[test]
+    fn rejects_non_unicast_macs() {
+        assert!(!is_unicast_mac("ff:ff:ff:ff:ff:ff")); // broadcast
+        assert!(!is_unicast_mac("01:00:5e:00:00:fb")); // IPv4 multicast
+        assert!(!is_unicast_mac("33:33:00:00:00:01")); // IPv6 multicast
+        assert!(!is_unicast_mac("00:00:00:00:00:00")); // incomplete
+        assert!(is_unicast_mac("aa:bb:cc:dd:ee:0f"));
+    }
+
+    #[test]
+    fn export_json_has_expected_shape() {
+        let now = Instant::now();
+        let state = ScanState {
+            subnet: Some("192.168.1.0/24".parse().unwrap()),
+            hosts: vec![HostInfo {
+                ip: Ipv4Addr::new(192, 168, 1, 10),
+                hostname: Some("nas.local".into()),
+                mac: Some("b8:27:eb:12:34:56".into()),
+                vendor: Some("Raspberry Pi".into()),
+                latency_ms: Some(1.5),
+                online: true,
+                is_new: false,
+                first_seen: now,
+                last_seen: now,
+            }],
+            ..Default::default()
+        };
+
+        let json = export_json(&state).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["subnet"], "192.168.1.0/24");
+        assert_eq!(v["total_hosts"], 1);
+        assert_eq!(v["online_hosts"], 1);
+        assert_eq!(v["hosts"][0]["ip"], "192.168.1.10");
+        assert_eq!(v["hosts"][0]["vendor"], "Raspberry Pi");
+        assert_eq!(v["hosts"][0]["latency_ms"], 1.5);
+    }
+
+    #[test]
+    fn vendor_lookup_detects_randomized_and_known_ouis() {
+        assert_eq!(lookup_vendor("b8:27:eb:12:34:56"), Some("Raspberry Pi"));
+        assert_eq!(lookup_vendor("B8-27-EB-12-34-56"), Some("Raspberry Pi"));
+        // locally-administered bit set → randomized privacy MAC
+        assert_eq!(lookup_vendor("da:11:22:33:44:55"), Some("Randomized"));
+        assert_eq!(lookup_vendor("11:22:33:44:55:66"), None);
+        assert_eq!(lookup_vendor("garbage"), None);
     }
 }

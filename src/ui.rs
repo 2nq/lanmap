@@ -1,6 +1,7 @@
+use std::cmp::Ordering;
 use std::io::stdout;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::{
     cursor::Show,
@@ -17,17 +18,88 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use crate::scanner::{ScanState, RESCAN_INTERVAL};
+use crate::scanner::{HostInfo, ScanState, RESCAN_INTERVAL};
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 // How long a newly-joined device keeps its "new" badge.
 const NEW_BADGE_TTL: Duration = Duration::from_secs(300);
+// How long a transient status line (e.g. "exported…") stays on screen.
+const STATUS_TTL: Duration = Duration::from_secs(4);
+
+#[derive(Clone, Copy, PartialEq)]
+enum SortMode {
+    Ip,
+    Latency,
+    Hostname,
+    LastSeen,
+}
+
+impl SortMode {
+    fn label(self) -> &'static str {
+        match self {
+            SortMode::Ip => "IP",
+            SortMode::Latency => "latency",
+            SortMode::Hostname => "hostname",
+            SortMode::LastSeen => "last seen",
+        }
+    }
+
+    fn next(self) -> SortMode {
+        match self {
+            SortMode::Ip => SortMode::Latency,
+            SortMode::Latency => SortMode::Hostname,
+            SortMode::Hostname => SortMode::LastSeen,
+            SortMode::LastSeen => SortMode::Ip,
+        }
+    }
+}
+
+/// The host rows to actually display, after filtering and sorting. IP is the
+/// tiebreaker for every mode so the order is stable frame-to-frame.
+fn visible_hosts(state: &ScanState, sort: SortMode, online_only: bool) -> Vec<&HostInfo> {
+    let mut v: Vec<&HostInfo> = state
+        .hosts
+        .iter()
+        .filter(|h| !online_only || h.online)
+        .collect();
+
+    let by_ip = |h: &&HostInfo| u32::from(h.ip);
+    match sort {
+        SortMode::Ip => v.sort_by_key(by_ip),
+        SortMode::Latency => v.sort_by(|a, b| {
+            // Unreachable hosts (no latency) sort last.
+            let ka = a.latency_ms.unwrap_or(f64::INFINITY);
+            let kb = b.latency_ms.unwrap_or(f64::INFINITY);
+            ka.partial_cmp(&kb)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| by_ip(a).cmp(&by_ip(b)))
+        }),
+        // Hosts without a hostname sort last.
+        SortMode::Hostname => v.sort_by_cached_key(|h| {
+            (
+                h.hostname.is_none(),
+                h.hostname.clone().unwrap_or_default().to_lowercase(),
+                u32::from(h.ip),
+            )
+        }),
+        // Most recently seen first.
+        SortMode::LastSeen => v.sort_by(|a, b| {
+            b.last_seen
+                .cmp(&a.last_seen)
+                .then_with(|| by_ip(a).cmp(&by_ip(b)))
+        }),
+    }
+    v
+}
 
 pub struct App {
     pub state: Arc<Mutex<ScanState>>,
     pub table_state: TableState,
     pub spinner_frame: usize,
     pub last_tick: Instant,
+    sort_mode: SortMode,
+    online_only: bool,
+    status: Option<(String, Instant)>,
 }
 
 impl App {
@@ -37,7 +109,27 @@ impl App {
             table_state: TableState::default(),
             spinner_frame: 0,
             last_tick: Instant::now(),
+            sort_mode: SortMode::Ip,
+            online_only: false,
+            status: None,
         }
+    }
+
+    /// Keep the selection within the visible list after filtering/sorting.
+    fn clamp_selection(&mut self, len: usize) {
+        match self.table_state.selected() {
+            Some(_) if len == 0 => self.table_state.select(None),
+            Some(i) if i >= len => self.table_state.select(Some(len - 1)),
+            _ => {}
+        }
+    }
+
+    fn export(&mut self) {
+        let msg = {
+            let state = self.state.lock().unwrap();
+            write_export(&state)
+        };
+        self.status = Some((msg, Instant::now()));
     }
 
     fn next_row(&mut self, len: usize) {
@@ -98,7 +190,11 @@ fn run_loop(state: Arc<Mutex<ScanState>>) -> anyhow::Result<()> {
             app.last_tick = Instant::now();
         }
 
-        let host_count = app.state.lock().unwrap().hosts.len();
+        let visible_count = {
+            let state = app.state.lock().unwrap();
+            visible_hosts(&state, app.sort_mode, app.online_only).len()
+        };
+        app.clamp_selection(visible_count);
 
         terminal.draw(|f| render(f, &mut app))?;
 
@@ -112,8 +208,11 @@ fn run_loop(state: Arc<Mutex<ScanState>>) -> anyhow::Result<()> {
                     KeyCode::Char('r') => {
                         app.state.lock().unwrap().rescan_requested = true;
                     }
-                    KeyCode::Down | KeyCode::Char('j') => app.next_row(host_count),
-                    KeyCode::Up | KeyCode::Char('k') => app.prev_row(host_count),
+                    KeyCode::Char('e') => app.export(),
+                    KeyCode::Char('s') => app.sort_mode = app.sort_mode.next(),
+                    KeyCode::Char('f') => app.online_only = !app.online_only,
+                    KeyCode::Down | KeyCode::Char('j') => app.next_row(visible_count),
+                    KeyCode::Up | KeyCode::Char('k') => app.prev_row(visible_count),
                     _ => {}
                 }
             }
@@ -123,7 +222,29 @@ fn run_loop(state: Arc<Mutex<ScanState>>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Write the current scan to `lanmap-<unixtime>.json` in the working directory.
+/// Returns a human-readable result for the status line.
+fn write_export(state: &ScanState) -> String {
+    let json = match crate::scanner::export_json(state) {
+        Ok(j) => j,
+        Err(e) => return format!("export failed: {}", e),
+    };
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let name = format!("lanmap-{}.json", ts);
+    match std::fs::write(&name, json) {
+        Ok(()) => format!("exported {} hosts → {}", state.hosts.len(), name),
+        Err(e) => format!("export failed: {}", e),
+    }
+}
+
 fn render(f: &mut Frame, app: &mut App) {
+    let sort_mode = app.sort_mode;
+    let online_only = app.online_only;
+    let spinner = app.spinner_frame;
+    let status = app.status.clone();
     let state = app.state.lock().unwrap();
 
     // Check for fatal error
@@ -150,12 +271,21 @@ fn render(f: &mut Frame, app: &mut App) {
         ])
         .split(f.area());
 
-    render_header(f, chunks[0], &state, app.spinner_frame);
-    render_table(f, chunks[1], &state, &mut app.table_state);
-    render_footer(f, chunks[2], &state);
+    let visible = visible_hosts(&state, sort_mode, online_only);
+
+    render_header(f, chunks[0], &state, spinner, sort_mode, online_only);
+    render_table(f, chunks[1], &visible, state.hosts.len(), &mut app.table_state);
+    render_footer(f, chunks[2], &state, status.as_ref());
 }
 
-fn render_header(f: &mut Frame, area: Rect, state: &ScanState, spinner_idx: usize) {
+fn render_header(
+    f: &mut Frame,
+    area: Rect,
+    state: &ScanState,
+    spinner_idx: usize,
+    sort_mode: SortMode,
+    online_only: bool,
+) {
     let subnet_str = state
         .subnet
         .map(|s| s.to_string())
@@ -179,7 +309,7 @@ fn render_header(f: &mut Frame, area: Rect, state: &ScanState, spinner_idx: usiz
         format!("● {} online", online_count)
     };
 
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             " lanmap ",
             Style::default()
@@ -199,7 +329,18 @@ fn render_header(f: &mut Frame, area: Rect, state: &ScanState, spinner_idx: usiz
                 Color::Green
             }),
         ),
-    ]);
+        Span::styled(
+            format!("  │  sort: {}", sort_mode.label()),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+    if online_only {
+        spans.push(Span::styled(
+            "  [online only]",
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    let line = Line::from(spans);
 
     let header = Paragraph::new(line)
         .block(
@@ -213,7 +354,13 @@ fn render_header(f: &mut Frame, area: Rect, state: &ScanState, spinner_idx: usiz
     f.render_widget(header, area);
 }
 
-fn render_table(f: &mut Frame, area: Rect, state: &ScanState, table_state: &mut TableState) {
+fn render_table(
+    f: &mut Frame,
+    area: Rect,
+    hosts: &[&HostInfo],
+    total: usize,
+    table_state: &mut TableState,
+) {
     let hdr = |label: &'static str| {
         Cell::from(label).style(
             Style::default()
@@ -233,8 +380,7 @@ fn render_table(f: &mut Frame, area: Rect, state: &ScanState, table_state: &mut 
     .height(1)
     .bottom_margin(1);
 
-    let rows: Vec<Row> = state
-        .hosts
+    let rows: Vec<Row> = hosts
         .iter()
         .map(|host| {
             let (status_sym, status_style) = if host.online {
@@ -282,7 +428,11 @@ fn render_table(f: &mut Frame, area: Rect, state: &ScanState, table_state: &mut 
         })
         .collect();
 
-    let title = format!(" {} hosts ", state.hosts.len());
+    let title = if hosts.len() == total {
+        format!(" {} hosts ", total)
+    } else {
+        format!(" {} / {} hosts ", hosts.len(), total)
+    };
 
     let table = Table::new(
         rows,
@@ -324,18 +474,28 @@ fn fmt_age(age: Duration) -> String {
     }
 }
 
-fn render_footer(f: &mut Frame, area: Rect, state: &ScanState) {
-    let next = if state.scanning {
-        "scanning…".to_string()
-    } else if state.rescan_requested {
-        "rescan queued".to_string()
-    } else if let Some(t) = state.last_scan {
-        let remaining = RESCAN_INTERVAL
-            .as_secs()
-            .saturating_sub(t.elapsed().as_secs());
-        format!("next scan in {}s", remaining)
-    } else {
-        "starting…".to_string()
+fn render_footer(f: &mut Frame, area: Rect, state: &ScanState, status: Option<&(String, Instant)>) {
+    // A fresh transient message (export result, etc.) takes over the right
+    // side; otherwise show the scan countdown.
+    let (right, right_style) = match status {
+        Some((msg, t)) if t.elapsed() < STATUS_TTL => {
+            (msg.clone(), Style::default().fg(Color::Green))
+        }
+        _ => {
+            let next = if state.scanning {
+                "scanning…".to_string()
+            } else if state.rescan_requested {
+                "rescan queued".to_string()
+            } else if let Some(t) = state.last_scan {
+                let remaining = RESCAN_INTERVAL
+                    .as_secs()
+                    .saturating_sub(t.elapsed().as_secs());
+                format!("next scan in {}s", remaining)
+            } else {
+                "starting…".to_string()
+            };
+            (next, Style::default().fg(Color::DarkGray))
+        }
     };
 
     let line = Line::from(vec![
@@ -343,9 +503,16 @@ fn render_footer(f: &mut Frame, area: Rect, state: &ScanState) {
         Span::raw(" quit  "),
         Span::styled("[r]", Style::default().fg(Color::Yellow)),
         Span::raw(" rescan  "),
-        Span::styled("[↑↓ / jk]", Style::default().fg(Color::Yellow)),
-        Span::raw(" navigate  "),
-        Span::styled(format!("│  {}", next), Style::default().fg(Color::DarkGray)),
+        Span::styled("[e]", Style::default().fg(Color::Yellow)),
+        Span::raw(" export  "),
+        Span::styled("[s]", Style::default().fg(Color::Yellow)),
+        Span::raw(" sort  "),
+        Span::styled("[f]", Style::default().fg(Color::Yellow)),
+        Span::raw(" filter  "),
+        Span::styled("[↑↓/jk]", Style::default().fg(Color::Yellow)),
+        Span::raw(" nav  "),
+        Span::styled("│  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(right, right_style),
     ]);
 
     let footer = Paragraph::new(line).block(
@@ -356,4 +523,84 @@ fn render_footer(f: &mut Frame, area: Rect, state: &ScanState) {
     );
 
     f.render_widget(footer, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn host(ip: [u8; 4], online: bool, latency: Option<f64>, hostname: Option<&str>) -> HostInfo {
+        let now = Instant::now();
+        HostInfo {
+            ip: Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]),
+            hostname: hostname.map(str::to_string),
+            mac: None,
+            vendor: None,
+            latency_ms: latency,
+            online,
+            is_new: false,
+            first_seen: now,
+            last_seen: now,
+        }
+    }
+
+    fn ips(hosts: &[&HostInfo]) -> Vec<Ipv4Addr> {
+        hosts.iter().map(|h| h.ip).collect()
+    }
+
+    fn state_with(hosts: Vec<HostInfo>) -> ScanState {
+        ScanState {
+            hosts,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn online_filter_hides_offline_hosts() {
+        let s = state_with(vec![
+            host([192, 168, 1, 2], true, Some(5.0), None),
+            host([192, 168, 1, 3], false, None, None),
+        ]);
+        let all = visible_hosts(&s, SortMode::Ip, false);
+        let online = visible_hosts(&s, SortMode::Ip, true);
+        assert_eq!(all.len(), 2);
+        assert_eq!(ips(&online), vec![Ipv4Addr::new(192, 168, 1, 2)]);
+    }
+
+    #[test]
+    fn latency_sort_puts_unreachable_last() {
+        let s = state_with(vec![
+            host([192, 168, 1, 2], true, Some(30.0), None),
+            host([192, 168, 1, 3], false, None, None),
+            host([192, 168, 1, 4], true, Some(2.0), None),
+        ]);
+        let sorted = visible_hosts(&s, SortMode::Latency, false);
+        assert_eq!(
+            ips(&sorted),
+            vec![
+                Ipv4Addr::new(192, 168, 1, 4), // 2ms
+                Ipv4Addr::new(192, 168, 1, 2), // 30ms
+                Ipv4Addr::new(192, 168, 1, 3), // no latency
+            ]
+        );
+    }
+
+    #[test]
+    fn hostname_sort_puts_nameless_last_case_insensitively() {
+        let s = state_with(vec![
+            host([192, 168, 1, 2], true, None, None),
+            host([192, 168, 1, 3], true, None, Some("Zebra")),
+            host([192, 168, 1, 4], true, None, Some("alpha")),
+        ]);
+        let sorted = visible_hosts(&s, SortMode::Hostname, false);
+        assert_eq!(
+            ips(&sorted),
+            vec![
+                Ipv4Addr::new(192, 168, 1, 4), // alpha
+                Ipv4Addr::new(192, 168, 1, 3), // Zebra
+                Ipv4Addr::new(192, 168, 1, 2), // no hostname
+            ]
+        );
+    }
 }

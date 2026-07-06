@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.0]
+
+### Added
+- **JSON export** (`e`) — writes the current scan to `lanmap-<unixtime>.json`
+  in the working directory, with a confirmation on the status line
+- **Sort cycling** (`s`) — order the table by IP, latency, hostname, or last
+  seen; unreachable/nameless hosts sort last, IP is the stable tiebreaker
+- **Online-only filter** (`f`) — hide offline hosts; the table title shows
+  `shown / total` while filtered
+- Header shows the active sort mode and filter state; the selection stays
+  clamped to the visible list when filtering/sorting changes it
+
 ## [0.2.0]
 
 ### Fixed

@@ -1,6 +1,6 @@
 [package]
 name = "lanmap"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Live LAN scanner with terminal dashboard"
 
@@ -12,4 +12,6 @@ ipnetwork = "0.20"
 dns-lookup = "2.0"
 ratatui = "0.28"
 crossterm = "0.28"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 anyhow = "1"

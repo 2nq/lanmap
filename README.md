@@ -16,6 +16,8 @@ A live LAN scanner with a terminal dashboard. Shows all devices on your network 
 - Reverse DNS hostname resolution
 - "★ new" badge for devices that join while lanmap is running
 - Offline hosts show when they were last seen
+- Sort by IP, latency, hostname, or last seen; filter to online-only
+- Export the current scan to JSON
 - Live ratatui TUI with animated scanning indicator
 - Auto-rescan every 30 seconds
 
@@ -38,6 +40,9 @@ lanmap --subnet 192.168.1.0/24
 | Key | Action |
 |-----|--------|
 | `r` | Force rescan |
+| `e` | Export scan to `lanmap-<unixtime>.json` |
+| `s` | Cycle sort (IP → latency → hostname → last seen) |
+| `f` | Toggle online-only filter |
 | `↑ / k` | Navigate up |
 | `↓ / j` | Navigate down |
 | `q / Esc` | Quit |

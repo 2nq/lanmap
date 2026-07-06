@@ -34,9 +34,14 @@ tokio::spawn(run_scanner)
 
 ui::run() [main thread]
   └─ panic hook + restore      terminal always restored on error/panic
-  └─ terminal.draw()           render from locked ScanState snapshot
-  └─ event::poll()             keyboard input → mutate state or break
+  └─ visible_hosts()           filter + sort a view over ScanState.hosts
+  └─ terminal.draw()           render header / table / footer from the view
+  └─ event::poll()             keyboard → mutate state, sort, filter, export
 ```
+
+The UI never mutates `hosts`; sorting and the online-only filter are a
+render-time view (`visible_hosts`) so the scanner stays the single writer.
+Export (`scanner::export_json`) serializes a snapshot to JSON on keypress.
 
 ## State machine
 
@@ -50,6 +55,7 @@ ui::run() [main thread]
 
 - **Alerts (new device):** `HostInfo.is_new` already flags these (UI badge);
   hook a notification into the ARP-merge step in `run_scanner`
-- **Export:** serialize `hosts` to JSON on keypress
+- **Export:** done — `e` writes JSON via `scanner::export_json`. CSV would be
+  a second serializer over the same snapshot
 - **Port scan:** add `open_ports: Vec<u16>` to `HostInfo`, scan in `probe_host`
 - **Bandwidth / connrs integration:** feed PIDs from connrs into a second panel
